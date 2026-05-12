@@ -30,6 +30,34 @@ const DANGEROUS_TERMS: &[&str] = &[
     "sudo",
     "rm -rf",
 ];
+const COMMUNICATION_TERMS: &[&str] = &[
+    "email",
+    "e-mail",
+    "mail",
+    "message",
+    "sms",
+    "dm",
+    "reply",
+    "forward",
+    "recipient",
+    "compose",
+    "send",
+    "post",
+    "tweet",
+    "share",
+    "invite",
+];
+const COMMUNICATION_DOMAINS: &[&str] = &[
+    "mail.google.com",
+    "gmail.com",
+    "outlook.live.com",
+    "outlook.office.com",
+    "teams.microsoft.com",
+    "slack.com",
+    "x.com",
+    "twitter.com",
+    "linkedin.com",
+];
 const SECRET_TERMS: &[&str] = &[
     "password",
     "passwd",
@@ -195,6 +223,7 @@ pub struct NormalizedRequest {
     pub risk_score: u8,
     pub decision_hint: DecisionHint,
     pub requires_confirmation: bool,
+    pub effects: Vec<String>,
     pub redactions: Vec<Redaction>,
     pub reasons: Vec<String>,
     pub provenance: Provenance,
@@ -240,6 +269,7 @@ pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
 
     let mut reasons = Vec::new();
     let mut redactions = Vec::new();
+    let mut effects = Vec::new();
     let (canonical_action, resource, raw_op, tool_name, mut sensitivity, mut score) =
         if let Some(action) = raw.action.as_ref() {
             normalize_action(
@@ -247,14 +277,26 @@ pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
                 raw.observation.as_ref(),
                 &mut reasons,
                 &mut redactions,
+                &mut effects,
             )?
         } else {
-            normalize_tool(raw.tool.as_ref().unwrap(), &mut reasons, &mut redactions)?
+            normalize_tool(
+                raw.tool.as_ref().unwrap(),
+                &mut reasons,
+                &mut redactions,
+                &mut effects,
+            )?
         };
 
     if contains_any(raw.task.as_deref().unwrap_or_default(), DANGEROUS_TERMS) {
         score = score.saturating_add(15);
+        add_effect(&mut effects, "irreversible_change");
         reasons.push("task text contains a dangerous or irreversible intent".to_string());
+    }
+    if contains_any(raw.task.as_deref().unwrap_or_default(), COMMUNICATION_TERMS) {
+        score = score.saturating_add(10);
+        add_effect(&mut effects, "external_communication");
+        reasons.push("task text indicates communication outside the local session".to_string());
     }
     if let Some(JsonValue::String(classification)) = raw.policy_hints.get("sensitivity") {
         let hinted = parse_sensitivity(classification);
@@ -297,6 +339,7 @@ pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
         risk_score: score,
         decision_hint,
         requires_confirmation,
+        effects,
         redactions,
         reasons,
         provenance: Provenance {
@@ -312,6 +355,7 @@ fn normalize_action(
     observation: Option<&RawObservation>,
     reasons: &mut Vec<String>,
     redactions: &mut Vec<Redaction>,
+    effects: &mut Vec<String>,
 ) -> Result<
     (
         CanonicalAction,
@@ -380,11 +424,22 @@ fn normalize_action(
         .unwrap_or_default();
     if contains_any(&target_text, DANGEROUS_TERMS) {
         score = score.saturating_add(35);
+        add_effect(effects, "irreversible_change");
         reasons.push("target text or label indicates a dangerous operation".to_string());
+    }
+    if is_external_communication(&target_text, &resource) {
+        score = score.saturating_add(30);
+        add_effect(effects, "external_communication");
+        if sensitivity < Sensitivity::Internal {
+            sensitivity = Sensitivity::Internal;
+        }
+        reasons
+            .push("action appears to communicate or publish outside the local session".to_string());
     }
     if contains_any(&target_text, SECRET_TERMS) {
         sensitivity = Sensitivity::Secret;
         score = score.saturating_add(35);
+        add_effect(effects, "credential_access");
         reasons.push("target metadata indicates a secret input or credential".to_string());
     } else if contains_any(&target_text, PII_TERMS) {
         sensitivity = Sensitivity::Sensitive;
@@ -402,6 +457,7 @@ fn normalize_action(
             });
             sensitivity = Sensitivity::Secret;
             score = score.saturating_add(30);
+            add_effect(effects, "credential_access");
             reasons.push("action value matched secret-value heuristics".to_string());
         }
     }
@@ -419,6 +475,7 @@ fn normalize_tool(
     tool: &RawToolCall,
     reasons: &mut Vec<String>,
     redactions: &mut Vec<Redaction>,
+    effects: &mut Vec<String>,
 ) -> Result<
     (
         CanonicalAction,
@@ -435,13 +492,16 @@ fn normalize_tool(
     let mut score = 35u8;
     let canonical = if contains_any(&name, &["shell", "exec", "command"]) {
         score = 90;
+        add_effect(effects, "local_code_execution");
         reasons.push("tool can execute local commands".to_string());
         CanonicalAction::Execute
     } else if contains_any(&name, &["write", "patch", "edit", "delete"]) {
         score = 65;
+        add_effect(effects, "resource_mutation");
         CanonicalAction::Write
     } else if contains_any(&name, &["http", "fetch", "request"]) {
         score = 50;
+        add_effect(effects, "network_request");
         CanonicalAction::Network
     } else if contains_any(&name, &["read", "open", "list"]) {
         score = 25;
@@ -468,11 +528,18 @@ fn normalize_tool(
             resource = url_resource;
         }
     }
+    if is_external_communication(&name, &resource) {
+        score = score.saturating_add(30);
+        add_effect(effects, "external_communication");
+        reasons
+            .push("tool appears to communicate or publish outside the local session".to_string());
+    }
     for (key, value) in &tool.args {
         let text = format!("{key} {}", value.to_compact_json());
         if contains_any(&text, SECRET_TERMS) || looks_secret(&text) {
             sensitivity = Sensitivity::Secret;
             score = score.saturating_add(25);
+            add_effect(effects, "credential_access");
             redactions.push(Redaction {
                 field: format!("tool.args.{key}"),
                 reason: "secret-like tool argument was withheld from normalized output".to_string(),
@@ -481,6 +548,7 @@ fn normalize_tool(
     }
     if contains_any(&name, DANGEROUS_TERMS) {
         score = score.saturating_add(25);
+        add_effect(effects, "irreversible_change");
         reasons.push("tool name indicates dangerous or irreversible operation".to_string());
     }
     Ok((
@@ -573,6 +641,19 @@ fn normalize_path(path: &str) -> String {
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     let h = haystack.to_ascii_lowercase();
     needles.iter().any(|needle| h.contains(needle))
+}
+
+fn add_effect(effects: &mut Vec<String>, effect: &str) {
+    if !effects.iter().any(|existing| existing == effect) {
+        effects.push(effect.to_string());
+    }
+}
+
+fn is_external_communication(text: &str, resource: &Resource) -> bool {
+    let domain = resource.domain.as_deref().unwrap_or_default();
+    let path = resource.path.as_deref().unwrap_or_default();
+    let context = format!("{text} {domain} {path}");
+    contains_any(&context, COMMUNICATION_TERMS) || contains_any(domain, COMMUNICATION_DOMAINS)
 }
 
 fn looks_secret(value: &str) -> bool {
@@ -938,6 +1019,15 @@ impl NormalizedRequest {
         o.insert(
             "requires_confirmation".to_string(),
             JsonValue::Bool(self.requires_confirmation),
+        );
+        o.insert(
+            "effects".to_string(),
+            JsonValue::Array(
+                self.effects
+                    .iter()
+                    .map(|effect| JsonValue::String(effect.clone()))
+                    .collect(),
+            ),
         );
         o.insert(
             "redactions".to_string(),
@@ -1354,6 +1444,60 @@ mod tests {
         assert_eq!(normalized.canonical_action, CanonicalAction::Execute);
         assert_eq!(normalized.decision_hint, DecisionHint::Deny);
         assert_eq!(normalized.risk_level, RiskLevel::Critical);
+    }
+
+    #[test]
+    fn send_email_click_is_external_communication() {
+        let raw = RawRequest {
+            observation: Some(RawObservation {
+                url: Some("https://mail.google.com/mail/u/0/#inbox".to_string()),
+                ..Default::default()
+            }),
+            action: Some(RawAction {
+                op: "CLICK".to_string(),
+                target: Some(RawTarget {
+                    text: Some("Send".to_string()),
+                    aria_label: Some("Send email".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let normalized = normalize(raw).unwrap();
+        assert_eq!(normalized.canonical_action, CanonicalAction::UiClick);
+        assert_eq!(normalized.sensitivity, Sensitivity::Sensitive);
+        assert_eq!(normalized.risk_level, RiskLevel::High);
+        assert_eq!(normalized.decision_hint, DecisionHint::Review);
+        assert!(normalized
+            .effects
+            .contains(&"external_communication".to_string()));
+    }
+
+    #[test]
+    fn email_tool_call_is_external_communication() {
+        let raw = RawRequest {
+            tool: Some(RawToolCall {
+                name: "email.send".to_string(),
+                args: BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        JsonValue::String("customer@example.com".to_string()),
+                    ),
+                    (
+                        "subject".to_string(),
+                        JsonValue::String("Contract update".to_string()),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+        let normalized = normalize(raw).unwrap();
+        assert_eq!(normalized.risk_level, RiskLevel::High);
+        assert_eq!(normalized.decision_hint, DecisionHint::Review);
+        assert!(normalized
+            .effects
+            .contains(&"external_communication".to_string()));
     }
 
     #[test]
