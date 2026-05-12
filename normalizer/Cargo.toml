@@ -1,0 +1,8 @@
+[package]
+name = "agent-permission-normalizer"
+version = "0.1.0"
+edition = "2021"
+description = "Rust normalizer for agent runtime permission requests"
+license = "MIT"
+
+[dependencies]
