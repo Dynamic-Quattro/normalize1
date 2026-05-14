@@ -75,6 +75,13 @@ or:
 cat request.json | cargo run --manifest-path normalizer/Cargo.toml -- --compact
 ```
 
+JSONL batch input is also supported. Each non-empty line is one request, and
+the output is a JSON list of normalized permission requests:
+
+```bash
+cargo run --manifest-path normalizer/Cargo.toml -- --jsonl --input requests.jsonl
+```
+
 ## Development
 
 ```bash

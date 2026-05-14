@@ -214,6 +214,9 @@ pub struct NormalizedRequest {
     pub user_id: Option<String>,
     pub session_id: Option<String>,
     pub timestamp: Option<String>,
+    pub task: Option<String>,
+    pub observation: Option<JsonValue>,
+    pub tool_args: Option<JsonValue>,
     pub canonical_action: CanonicalAction,
     pub capability: String,
     pub resource: Resource,
@@ -260,6 +263,20 @@ pub fn raw_request_from_json(input: &str) -> Result<RawRequest, NormalizeError> 
 pub fn normalize_json(input: &str) -> Result<String, NormalizeError> {
     let raw = raw_request_from_json(input)?;
     Ok(normalize(raw)?.to_json_pretty())
+}
+
+pub fn normalize_jsonl(input: &str, pretty: bool) -> Result<String, NormalizeError> {
+    let mut items = Vec::new();
+    for (idx, line) in input.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw = raw_request_from_json(line)
+            .map_err(|err| NormalizeError::InvalidJson(format!("line {}: {err}", idx + 1)))?;
+        items.push(normalize(raw)?.to_json_value());
+    }
+    Ok(json_to_string(&JsonValue::Array(items), 0, pretty))
 }
 
 pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
@@ -323,6 +340,12 @@ pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
     let requires_confirmation = !matches!(risk_level, RiskLevel::Low);
     let capability = capability_for(&canonical_action, &resource, &sensitivity);
     let scope = build_scope(&resource, &canonical_action, &sensitivity);
+    let task = raw.task.clone();
+    let observation = raw.observation.as_ref().map(RawObservation::to_json_value);
+    let tool_args = raw
+        .tool
+        .as_ref()
+        .map(|tool| JsonValue::Object(sanitize_tool_args(&tool.args)));
 
     Ok(NormalizedRequest {
         request_id: raw.request_id,
@@ -330,6 +353,9 @@ pub fn normalize(raw: RawRequest) -> Result<NormalizedRequest, NormalizeError> {
         user_id: raw.user_id,
         session_id: raw.session_id,
         timestamp: raw.timestamp,
+        task,
+        observation,
+        tool_args,
         canonical_action,
         capability,
         resource,
@@ -501,6 +527,10 @@ fn normalize_tool(
         CanonicalAction::Write
     } else if contains_any(&name, &["http", "fetch", "request"]) {
         score = 50;
+        add_effect(effects, "network_request");
+        CanonicalAction::Network
+    } else if contains_any(&name, COMMUNICATION_TERMS) {
+        score = 45;
         add_effect(effects, "network_request");
         CanonicalAction::Network
     } else if contains_any(&name, &["read", "open", "list"]) {
@@ -708,6 +738,38 @@ fn target_risk_text(target: &RawTarget) -> String {
     chunks.join(" ")
 }
 
+fn sanitize_tool_args(args: &BTreeMap<String, JsonValue>) -> BTreeMap<String, JsonValue> {
+    args.iter()
+        .map(|(key, value)| {
+            let redacted = contains_any(key, SECRET_TERMS);
+            (key.clone(), sanitize_json_value(value, redacted))
+        })
+        .collect()
+}
+
+fn sanitize_json_value(value: &JsonValue, redacted: bool) -> JsonValue {
+    match value {
+        JsonValue::String(s) if redacted || looks_secret(s) => {
+            JsonValue::String("[REDACTED]".to_string())
+        }
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .iter()
+                .map(|item| sanitize_json_value(item, redacted))
+                .collect(),
+        ),
+        JsonValue::Object(obj) => JsonValue::Object(
+            obj.iter()
+                .map(|(key, value)| {
+                    let child_redacted = redacted || contains_any(key, SECRET_TERMS);
+                    (key.clone(), sanitize_json_value(value, child_redacted))
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 fn string_arg<'a>(args: &'a BTreeMap<String, JsonValue>, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| args.get(*key).and_then(JsonValue::as_str))
@@ -816,6 +878,19 @@ impl RawObservation {
                 .cloned()
                 .unwrap_or_default(),
         })
+    }
+
+    fn to_json_value(&self) -> JsonValue {
+        let mut o = BTreeMap::new();
+        insert_opt(&mut o, "url", &self.url);
+        insert_opt(&mut o, "title", &self.title);
+        if !self.viewport.is_empty() {
+            o.insert(
+                "viewport".to_string(),
+                JsonValue::Object(self.viewport.clone()),
+            );
+        }
+        JsonValue::Object(o)
     }
 }
 
@@ -982,6 +1057,13 @@ impl NormalizedRequest {
         insert_opt(&mut o, "user_id", &self.user_id);
         insert_opt(&mut o, "session_id", &self.session_id);
         insert_opt(&mut o, "timestamp", &self.timestamp);
+        insert_opt(&mut o, "task", &self.task);
+        if let Some(observation) = &self.observation {
+            o.insert("observation".to_string(), observation.clone());
+        }
+        if let Some(tool_args) = &self.tool_args {
+            o.insert("tool_args".to_string(), tool_args.clone());
+        }
         o.insert(
             "canonical_action".to_string(),
             JsonValue::String(self.canonical_action.as_str().to_string()),
@@ -1493,11 +1575,40 @@ mod tests {
             ..Default::default()
         };
         let normalized = normalize(raw).unwrap();
+        assert_eq!(normalized.canonical_action, CanonicalAction::Network);
         assert_eq!(normalized.risk_level, RiskLevel::High);
         assert_eq!(normalized.decision_hint, DecisionHint::Review);
         assert!(normalized
             .effects
             .contains(&"external_communication".to_string()));
+    }
+
+    #[test]
+    fn normalizes_jsonl_to_json_list() {
+        let input = r##"
+{"request_id":"r1","action":{"op":"NAVIGATE","value":"https://example.com"}}
+{"request_id":"r2","tool":{"name":"email.send","args":{"to":"customer@example.com"}}}
+"##;
+        let output = normalize_jsonl(input, false).unwrap();
+        let parsed = parse_json(&output).unwrap();
+        let JsonValue::Array(items) = parsed else {
+            panic!("jsonl output should be a JSON array");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(output.contains("\"request_id\":\"r1\""));
+        assert!(output.contains("\"request_id\":\"r2\""));
+        assert!(output.contains("\"external_communication\""));
+    }
+
+    #[test]
+    fn preserves_context_fields_for_score_engine() {
+        let input = r##"{"request_id":"r1","task":"로그 파일을 확인해줘","source":"sdk-wrapper","observation":{"url":"https://console.example/logs","title":"Logs"},"tool":{"name":"file.read","args":{"path":"/var/log/app.log","api_key":"sk-test-secret-value-12345"}}}"##;
+        let output = normalize_json(input).unwrap();
+        assert!(output.contains("\"task\": \"로그 파일을 확인해줘\""));
+        assert!(output.contains("\"observation\""));
+        assert!(output.contains("\"tool_args\""));
+        assert!(output.contains("\"path\": \"/var/log/app.log\""));
+        assert!(output.contains("\"api_key\": \"[REDACTED]\""));
     }
 
     #[test]
